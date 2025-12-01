@@ -1,0 +1,31 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080
+  },
+  "esp32_ip": "192.168.1.11",
+  "esp32_port": 80,
+  "features": {
+    "funasr_enabled": false,
+    "intelligent_analysis": false,
+    "camera_web_enabled": false
+  },
+  "funasr": {
+    "model_name": "paraformer-zh",
+    "device": "cpu",
+    "sample_rate": 16000
+  },
+  "camera": {
+    "auto_capture_interval": 30,
+    "image_quality": 95
+  },
+  "analysis": {
+    "min_segment_duration": 2.0,
+    "max_segment_duration": 30.0
+  },
+  "notes": {
+    "esp32_ip": "修改为你的 ESP32 IP 地址",
+    "device": "cpu",
+    "funasr_device": "修改为 'cuda' 如果有 GPU，否则使用 'cpu'"
+  }
+}

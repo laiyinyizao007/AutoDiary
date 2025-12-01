@@ -1,0 +1,43 @@
+{
+  "name": "AutoDiary",
+  "version": "1.0.0",
+  "description": "全自动音视频 Lifelog 系统 - 基于 XIAO ESP32S3 Sense",
+  "type": "embedded-system",
+  "technologies": [
+    "ESP32-S3",
+    "Python",
+    "C++",
+    "WebSocket",
+    "FFmpeg"
+  ],
+  "structure": {
+    "firmware": "src/main.cpp",
+    "backend": "scripts/servers/server.py",
+    "documentation": "docs/",
+    "configuration": "config/",
+    "scripts": "scripts/",
+    "data": "data/"
+  },
+  "mainEntryPoints": {
+    "backend": "scripts/servers/server.py",
+    "firmware": "src/main.cpp",
+    "deployment": "scripts/deployment/run_complete_workflow.py"
+  },
+  "dependencies": {
+    "python": "3.8+",
+    "platformio": "latest",
+    "ffmpeg": "4.2+",
+    "websockets": "11.0+"
+  },
+  "buildSteps": [
+    "pip install -r config/requirements.txt",
+    "pio run -e seeed_xiao_esp32s3_sense",
+    "pio run --target upload -e seeed_xiao_esp32s3_sense"
+  ],
+  "runSteps": [
+    "python scripts/servers/server.py"
+  ],
+  "relatedProjects": [],
+  "author": "AutoDiary Development Team",
+  "license": "MIT"
+}

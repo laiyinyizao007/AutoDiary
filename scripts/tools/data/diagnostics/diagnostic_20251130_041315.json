@@ -1,0 +1,17 @@
+{
+  "timestamp": "2025-11-30T04:13:15.364436",
+  "checkpoint_file": "data\\Logs\\test_checkpoint_data.json",
+  "total_checkpoints": 17,
+  "faults": [
+    {
+      "name": "存储诊断",
+      "level": "error",
+      "issues": [
+        "未检测到保存的文件"
+      ]
+    }
+  ],
+  "recommendations": [
+    "检查 SPIFFS 初始化和文件系统权限"
+  ]
+}
