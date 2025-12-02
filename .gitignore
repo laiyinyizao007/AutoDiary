@@ -41,3 +41,19 @@ test_photo.jpg
 # OS files
 .DS_Store
 Thumbs.db
+nul
+
+# Tools - Model files (too large for git)
+tools/models/*.onnx
+tools/models/*.tar.bz2
+tools/models/paraformer/
+tools/models/sherpa-onnx-*/
+
+# Tools - Data files (transcripts, diary entries)
+tools/data/
+
+# Tools - Archived code
+tools/_archived/
+
+# Temp audio files
+*.pcm

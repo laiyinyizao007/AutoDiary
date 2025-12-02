@@ -50,9 +50,12 @@ camera_config_t config;
 #define AUDIO_CHANNELS        1
 
 // 音频缓冲区 (环形缓冲区)
+#define AUDIO_CHUNK_SIZE    4096   // 每次传输的音频块大小
 short audio_buffer[AUDIO_BUFFER_SIZE * 2];
+uint8_t audio_stream_buffer[AUDIO_CHUNK_SIZE];  // 用于 HTTP 传输的缓冲区
 volatile uint32_t audio_buffer_pos = 0;
 volatile bool audio_data_ready = false;
+volatile bool audio_streaming = false;  // 是否正在流式传输音频
 
 // 任务句柄
 TaskHandle_t videoTaskHandle = NULL;
@@ -132,6 +135,7 @@ void handleCapture();
 void handleSave();
 void handleSavedPhoto();
 void handleAudio();
+void handleAudioStream();
 void handleStatus();
 void handleRestart();
 void handleNotFound();
@@ -294,13 +298,24 @@ void setupCamera() {
     config.pin_reset = RESET_GPIO_NUM;
     config.xclk_freq_hz = 20000000;
 
-    // 使用参考项目的配置参数
-    config.frame_size = FRAMESIZE_UXGA;      // 参考项目使用 UXGA
+    // 摄像头配置 - 使用较低分辨率确保稳定性
     config.pixel_format = PIXFORMAT_JPEG;
-    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;  // 修复: 使用参考项目的值
-    config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.jpeg_quality = 12;
-    config.fb_count = 1;  // 修复: 参考项目使用 1
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+    // 根据 PSRAM 可用性选择配置
+    if (psramFound()) {
+        config.frame_size = FRAMESIZE_VGA;  // 640x480，更稳定
+        config.fb_location = CAMERA_FB_IN_PSRAM;
+        config.jpeg_quality = 10;  // 更高质量
+        config.fb_count = 2;
+        Serial.println("[DEBUG] 使用 PSRAM 配置");
+    } else {
+        config.frame_size = FRAMESIZE_QVGA;  // 320x240，无 PSRAM 时使用
+        config.fb_location = CAMERA_FB_IN_DRAM;
+        config.jpeg_quality = 12;
+        config.fb_count = 1;
+        Serial.println("[DEBUG] 使用 DRAM 配置 (无 PSRAM)");
+    }
 
     Serial.println("[DEBUG] 正在调用 esp_camera_init()...");
     esp_err_t err = esp_camera_init(&config);
@@ -314,9 +329,15 @@ void setupCamera() {
             Serial.printf("[DEBUG] 摄像头 PID: 0x%X\n", s->id.PID);
             Serial.printf("摄像头型号: %s\n", s->id.PID == OV2640_PID ? "OV2640" : "Unknown");
 
-            // 降低分辨率以确保稳定性
-            s->set_framesize(s, FRAMESIZE_VGA);  // 640x480
-            Serial.println("[DEBUG] 分辨率已调整为 VGA (640x480)");
+            // 调整摄像头参数以获得更好的图像质量
+            s->set_brightness(s, 0);     // 亮度 (-2 to 2)
+            s->set_contrast(s, 0);       // 对比度 (-2 to 2)
+            s->set_saturation(s, 0);     // 饱和度 (-2 to 2)
+            s->set_whitebal(s, 1);       // 自动白平衡
+            s->set_awb_gain(s, 1);       // 自动白平衡增益
+            s->set_exposure_ctrl(s, 1);  // 自动曝光
+            s->set_aec2(s, 0);           // AEC DSP
+            s->set_gain_ctrl(s, 1);      // 自动增益
         }
 
         // 测试拍照
@@ -384,13 +405,16 @@ void setupWebServer() {
     server.on("/save", HTTP_GET, handleSave);
     server.on("/saved_photo", HTTP_GET, handleSavedPhoto);
     server.on("/audio", HTTP_GET, onAudioCapture);
+    server.on("/audio/stream", HTTP_GET, handleAudioStream);  // 音频流端点
     server.on("/status", HTTP_GET, handleStatus);
     server.on("/restart", HTTP_GET, handleRestart);
-    
+
     server.onNotFound(handleNotFound);
-    
+
     server.begin();
     Serial.println("✅ HTTP 服务器启动成功 (端口 80)");
+    Serial.println("   /audio - 单次音频采集");
+    Serial.println("   /audio/stream - 实时音频流");
 }
 
 // ==================== HTTP 请求处理函数 ====================
@@ -523,9 +547,116 @@ void handleSavedPhoto() {
 }
 
 void onAudioCapture() {
-    // 返回音频数据（MIME type: audio/wav）
-    server.sendHeader("Content-Type", "audio/wav");
-    server.send(200, "text/plain", "Audio stream endpoint");
+    // 返回实时音频数据 (原始 PCM 16-bit, 16kHz, 单声道)
+    Serial.println("\n[DEBUG] ========== /audio 请求 ==========");
+
+    if (!i2s_initialized) {
+        Serial.println("[ERROR] I2S 未初始化!");
+        server.send(503, "text/plain", "I2S not initialized");
+        return;
+    }
+
+    // 读取一块音频数据
+    size_t total_read = 0;
+    unsigned long start_time = millis();
+    unsigned long timeout = 500;  // 500ms 超时
+
+    while (total_read < AUDIO_CHUNK_SIZE && (millis() - start_time) < timeout) {
+        size_t bytes_available = I2S.available();
+        if (bytes_available > 0) {
+            size_t bytes_to_read = min(bytes_available, (size_t)(AUDIO_CHUNK_SIZE - total_read));
+            size_t bytes_read = I2S.readBytes((char*)(audio_stream_buffer + total_read), bytes_to_read);
+            total_read += bytes_read;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (total_read > 0) {
+        Serial.printf("[OK] 音频数据: %d bytes\n", total_read);
+
+        // 发送原始 PCM 数据
+        server.sendHeader("Content-Type", "audio/raw");
+        server.sendHeader("Content-Length", String(total_read));
+        server.sendHeader("X-Audio-Format", "pcm-16bit-16khz-mono");
+        server.sendHeader("Cache-Control", "no-cache");
+        server.send_P(200, "audio/raw", (const char*)audio_stream_buffer, total_read);
+
+        audio_bytes_captured += total_read;
+    } else {
+        Serial.println("[WARN] 无音频数据");
+        server.send(204, "text/plain", "No audio data");
+    }
+
+    Serial.println("[DEBUG] ========== 音频请求完成 ==========\n");
+}
+
+void handleAudioStream() {
+    // 流式音频端点 - 持续发送音频数据
+    Serial.println("\n[DEBUG] ========== /audio/stream 请求 ==========");
+
+    if (!i2s_initialized) {
+        server.send(503, "text/plain", "I2S not initialized");
+        return;
+    }
+
+    WiFiClient client = server.client();
+
+    // 发送 HTTP 头
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: audio/raw");
+    client.println("X-Audio-Format: pcm-16bit-16khz-mono");
+    client.println("Transfer-Encoding: chunked");
+    client.println("Cache-Control: no-cache");
+    client.println("Connection: keep-alive");
+    client.println();
+
+    audio_streaming = true;
+    unsigned long last_send = millis();
+    int chunks_sent = 0;
+
+    Serial.println("[DEBUG] 开始音频流传输...");
+
+    while (client.connected() && audio_streaming) {
+        size_t total_read = 0;
+
+        // 读取音频数据
+        while (total_read < AUDIO_CHUNK_SIZE) {
+            size_t bytes_available = I2S.available();
+            if (bytes_available > 0) {
+                size_t bytes_to_read = min(bytes_available, (size_t)(AUDIO_CHUNK_SIZE - total_read));
+                size_t bytes_read = I2S.readBytes((char*)(audio_stream_buffer + total_read), bytes_to_read);
+                total_read += bytes_read;
+            } else {
+                break;
+            }
+        }
+
+        if (total_read > 0) {
+            // 发送 chunked 数据
+            char chunk_header[16];
+            sprintf(chunk_header, "%X\r\n", total_read);
+            client.print(chunk_header);
+            client.write(audio_stream_buffer, total_read);
+            client.print("\r\n");
+
+            audio_bytes_captured += total_read;
+            chunks_sent++;
+
+            if (millis() - last_send > 5000) {
+                Serial.printf("[DEBUG] 音频流: 已发送 %d 块\n", chunks_sent);
+                last_send = millis();
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));  // 约 20 次/秒
+    }
+
+    // 发送结束标记
+    client.print("0\r\n\r\n");
+    audio_streaming = false;
+
+    Serial.printf("[DEBUG] 音频流结束，共发送 %d 块\n", chunks_sent);
 }
 
 void handleStatus() {
