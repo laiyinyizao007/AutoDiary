@@ -364,7 +364,8 @@ class RealtimeRecorder:
                  buffer_seconds: float = 30.0,
                  min_speech_ms: int = 500,  # 降低最小语音长度，让VAD自己判断
                  silence_threshold_ms: int = 2000,  # 静默阈值：增加到2秒，积累更多上下文
-                 paragraph_gap_minutes: float = 5.0):
+                 paragraph_gap_minutes: float = 1.0,  # 段落间隔：1分钟无语音视为新段落
+                 save_audio: bool = False):  # 新增：是否保存音频
 
         self.recognizer = recognizer
         self.vad_model = vad_model
@@ -376,6 +377,7 @@ class RealtimeRecorder:
         self.min_speech_ms = min_speech_ms
         self.silence_threshold_ms = silence_threshold_ms  # 静默阈值
         self.paragraph_gap_seconds = paragraph_gap_minutes * 60  # 转换为秒
+        self.save_audio = save_audio  # 新增：是否保存音频
 
         self.chunk_size = 1024
         self.audio_buffer = []
@@ -402,6 +404,13 @@ class RealtimeRecorder:
         self.summary_dir = Path(__file__).parent / "data" / "Summary"
         self.summary_dir.mkdir(parents=True, exist_ok=True)
 
+        # 音频保存相关（新增）
+        self.wav_file = None
+        self.audio_save_path = None
+        self.audio_dir = Path(__file__).parent / "data" / "Audio"
+        self.audio_dir.mkdir(parents=True, exist_ok=True)
+        self.paragraph_start_time = None  # 当前段落开始时间
+
     def get_diary_path(self) -> Path:
         """Get today's diary file path"""
         today = datetime.date.today().strftime("%Y%m%d")
@@ -411,6 +420,65 @@ class RealtimeRecorder:
         """Get today's summary file path"""
         today = datetime.date.today().strftime("%Y%m%d")
         return self.summary_dir / f"summary_{today}.txt"
+
+    def start_paragraph_audio(self):
+        """开始新段落的音频文件
+
+        注意：在打开新文件前，先关闭并重命名旧文件。
+        这样可以保证音频录制不会中断（在段落之间持续录制）。
+        """
+        if not self.save_audio:
+            return
+
+        # 先关闭上一个段落的音频文件（如果存在）
+        if self.wav_file is not None:
+            self.close_paragraph_audio()
+
+        # 记录新段落开始时间
+        self.paragraph_start_time = datetime.datetime.now()
+
+        # 生成文件名: paragraph_YYYYMMDD_HHMMSS_HHMMSS.wav (第二个时间戳在关闭时更新)
+        date_str = self.paragraph_start_time.strftime("%Y%m%d")
+        start_time_str = self.paragraph_start_time.strftime("%H%M%S")
+
+        # 临时文件名（段落结束时重命名）
+        temp_filename = f"paragraph_{date_str}_{start_time_str}_temp.wav"
+        self.audio_save_path = self.audio_dir / temp_filename
+
+        # 打开 WAV 文件
+        import wave
+        self.wav_file = wave.open(str(self.audio_save_path), 'wb')
+        self.wav_file.setnchannels(1)  # 单声道
+        self.wav_file.setsampwidth(2)  # 16-bit
+        self.wav_file.setframerate(self.device_sample_rate)  # 设备原始采样率
+
+        print(f"[段落音频] 开始: {temp_filename}")
+
+    def close_paragraph_audio(self):
+        """关闭当前段落的音频文件并重命名"""
+        if not self.save_audio or not self.wav_file:
+            return
+
+        # 关闭文件
+        self.wav_file.close()
+        self.wav_file = None
+
+        # 生成最终文件名（包含起止时间戳）
+        end_time = datetime.datetime.now()
+        date_str = self.paragraph_start_time.strftime("%Y%m%d")
+        start_time_str = self.paragraph_start_time.strftime("%H%M%S")
+        end_time_str = end_time.strftime("%H%M%S")
+
+        final_filename = f"paragraph_{date_str}_{start_time_str}_{end_time_str}.wav"
+        final_path = self.audio_dir / final_filename
+
+        # 重命名临时文件
+        if self.audio_save_path.exists():
+            self.audio_save_path.rename(final_path)
+            print(f"[段落音频] 完成: {final_filename}")
+
+        self.audio_save_path = None
+        self.paragraph_start_time = None
 
     def append_single_entry(self, timestamp: str, raw_text: str, optimized_text: str):
         """实时写入单条识别结果到日记文件"""
@@ -462,6 +530,9 @@ class RealtimeRecorder:
         # 写入 Summary 文件（只包含时间和总结）
         self.append_summary(entries, summary)
         print(f"  -> 摘要已保存到 Summary 文件")
+
+        # 注意：不在这里关闭音频文件
+        # 音频录制持续进行，文件会在下一段落开始时自动关闭并重命名
 
     def check_paragraph_gap(self):
         """Check if we should flush pending texts due to time gap"""
@@ -577,9 +648,16 @@ class RealtimeRecorder:
 
             # 累积到待处理列表（用于后续生成 Summary）
             with self.pending_lock:
+                # 如果是新段落的第一条语音，开始新的音频文件
+                is_first_text = len(self.pending_texts) == 0
+
                 self.pending_texts.append((timestamp, raw_text, optimized_text))
                 self.last_speech_time = time.time()
                 pending_count = len(self.pending_texts)
+
+                # 开始新段落的音频文件
+                if is_first_text and self.wav_file is None:
+                    self.start_paragraph_audio()
 
             print(f"  -> 已累积 (当前段落共 {pending_count} 条语音，等待静默后生成摘要)")
 
@@ -679,9 +757,16 @@ class RealtimeRecorder:
 
             # 累积到待处理列表
             with self.pending_lock:
+                # 如果是新段落的第一条语音，开始新的音频文件
+                is_first_text = len(self.pending_texts) == 0
+
                 self.pending_texts.append((timestamp, raw_text, optimized_text))
                 self.last_speech_time = time.time()
                 pending_count = len(self.pending_texts)
+
+                # 开始新段落的音频文件
+                if is_first_text and self.wav_file is None:
+                    self.start_paragraph_audio()
 
             print(f"  -> 已累积 (当前段落共 {pending_count} 条)")
 
@@ -689,6 +774,13 @@ class RealtimeRecorder:
         """PyAudio callback for recording - VAD 驱动的智能处理"""
         audio_chunk = np.frombuffer(in_data, dtype=np.float32)
 
+        # 先保存到 WAV 文件（如果启用）
+        if self.save_audio and self.wav_file:
+            # 转换 float32 [-1.0, 1.0] 到 int16 [-32768, 32767]
+            audio_int16 = (audio_chunk * 32767).astype(np.int16)
+            self.wav_file.writeframes(audio_int16.tobytes())
+
+        # 然后再进行 VAD 和识别处理
         with self.buffer_lock:
             self.audio_buffer.append(audio_chunk)
 
@@ -810,6 +902,10 @@ class RealtimeRecorder:
         print(f"[静默阈值] {self.silence_threshold_ms} ms (超过此时间触发处理)")
         print(f"[段落间隔] {self.paragraph_gap_seconds/60:.1f} 分钟 (超过此时间视为新段落)")
         print(f"[模式] VAD 驱动的智能触发（语音结束后自动处理）")
+
+        if self.save_audio:
+            print(f"[音频保存] 按段落分段保存到 {self.audio_dir}")
+
         print(f"\n开始录音... 按 Ctrl+C 停止\n")
 
         self.stream = self.audio.open(
@@ -854,6 +950,10 @@ class RealtimeRecorder:
         if self.pending_texts:
             print("处理剩余累积文本...")
             self.flush_pending_texts()
+
+        # 关闭最后一个段落的音频文件（如果有）
+        if self.wav_file:
+            self.close_paragraph_audio()
 
         if self.stream:
             self.stream.stop_stream()
@@ -901,6 +1001,8 @@ def get_args():
     parser.add_argument("--paragraph-gap", type=float, default=5.0,
                         help="Paragraph gap in minutes (default: 5.0). "
                              "If no speech for this duration, trigger paragraph summarization.")
+    parser.add_argument("--save-audio", action="store_true",
+                        help="Save raw audio to WAV file while recognizing (default: False)")
     parser.add_argument("--list-devices", action="store_true",
                         help="List audio devices and exit")
 
@@ -977,7 +1079,8 @@ def main():
         buffer_seconds=args.buffer_seconds,
         min_speech_ms=args.min_speech,
         silence_threshold_ms=args.silence_threshold,
-        paragraph_gap_minutes=args.paragraph_gap
+        paragraph_gap_minutes=args.paragraph_gap,
+        save_audio=args.save_audio  # 新增：传递音频保存参数
     )
 
     recorder.start()
